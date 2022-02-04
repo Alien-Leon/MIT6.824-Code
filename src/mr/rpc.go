@@ -22,6 +22,7 @@ import "strconv"
 
 func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// 日志的处理可以更通用些
 	log.SetOutput(os.Stdout)
 
 	gob.Register(&MapTask{})
@@ -62,7 +63,6 @@ func (t *ControlTask) Do(ctx context.Context, w *worker) error {
 		log.Println("All tasks done. exit...")
 		w.offline()
 		os.Exit(0)
-		// TODO 更完善友好的离线
 	case "Wait":
 		log.Println("Waiting for task")
 		time.Sleep(time.Second)

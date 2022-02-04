@@ -62,7 +62,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		// TODO 任务状态流转与上报
 
 		// 当前上报只有一次，不会在任务运行时做周期性上报，一旦上报请求失败，那么coordinator的任务状态更新也会失败，随后任务可能会被重新调度执行
-
+		// TODO 综合heartbeat 考虑是否在周期性heartbeat的时候同时上报任务状态?
 		w.reportTaskStatus(task, "running")
 		err := task.Do(w.ctx, w)
 		if err != nil {
@@ -74,10 +74,8 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		w.reportTaskStatus(task, "done")
-
 	}
 
-	w.offline()
 }
 
 type worker struct {
@@ -104,7 +102,6 @@ func (w *worker) offline() (ok bool) {
 }
 
 func (w *worker) getTask() (t Task) {
-
 	call("Coordinator.GetTask", w.Name, &t)
 	return
 }

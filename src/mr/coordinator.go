@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"time"
+	"go.uber.org/atomic"
 )
 import "net"
 import "os"
@@ -16,12 +17,6 @@ import "net/http"
 
 type Coordinator struct {
 	workers sync.Map // map[string]*WorkerInstance
-
-	//mapLock *sync.Mutex
-	//mapTaskQueue []MapTask
-
-	//reduceLock *sync.Mutex
-	//reduceTaskQueue []ReduceTask
 
 	files      []string
 	nReduce    int
@@ -32,7 +27,8 @@ type Coordinator struct {
 
 type WorkerInstance struct {
 	Name          string
-	HeartBeatTime time.Time // TODO 如果太久没有心跳，那么认为实例已离线，任务需要重新分发
+	HeartBeatTime atomic.Time // TODO 如果太久没有心跳，那么认为实例已离线，任务需要重新分发
+
 	// 如果任务因超时而离线，后续任务完成时又进行了上报，那么此时需要保证上报任务状态的原子性以及幂等性。
 	// 同时需要确认任务的归属，保证任务状态不会被其他worker修改
 }
@@ -71,7 +67,7 @@ func (c *Coordinator) HeartBeatWorker(name string, _ *struct{}) error {
 		return fmt.Errorf("worker has not registered")
 	}
 	w := v.(*WorkerInstance)
-	w.HeartBeatTime = time.Now()
+	w.HeartBeatTime.Store(time.Now())
 	return nil
 }
 
@@ -129,11 +125,6 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	//ret := false
-	//
-	//time.Sleep(60 * time.Second)
-	//ret = true
-
 	<-c.done
 
 	return true
@@ -144,16 +135,23 @@ func (c *Coordinator) checkWorkerHealth() {
 
 	for {
 		now := time.Now()
-
+		
+		var workersUnhealthy []*WorkerInstance
 		c.workers.Range(func(key, value interface{}) bool {
-			// TODO 对worker内部属性的并发访问？
 			w := value.(*WorkerInstance)
-			if now.Sub(w.HeartBeatTime) > healthTimeout {
-				// TODO set unhealthy，相关的任务重调度由TaskManager来做
+			if now.Sub(w.HeartBeatTime.Load()) > healthTimeout {
+				c.mapTask.ReAssignWorkerTask(w.Name)
+				c.reduceTask.ReAssignWorkerTask(w.Name)
+				workersUnhealthy = append(workersUnhealthy, w)
 			}
 
 			return true
 		})
+
+		for _, worker := range workersUnhealthy {
+			c.workers.Delete(worker.Name)
+			log.Printf("worker %s is unhealthy, now cleaning.", worker.Name)
+		}
 
 		time.Sleep(time.Second)
 	}
@@ -175,7 +173,6 @@ func (c *Coordinator) coordinate() {
 	log.Println("all task done")
 
 	close(c.done)
-
 }
 
 func (c *Coordinator) dispatchMapTask() {
@@ -227,8 +224,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		files:      files,
 		nReduce:    nReduce,
 		done:       make(chan bool),
-		mapTask:    NewTaskManger(time.Second * 5),
-		reduceTask: NewTaskManger(time.Second * 5),
+		mapTask:    NewTaskManger(time.Minute),
+		reduceTask: NewTaskManger(time.Minute),
 	}
 
 	// 任务队列 map - wait - reduce - wait - done

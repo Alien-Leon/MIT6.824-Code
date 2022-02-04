@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -30,10 +31,10 @@ func (t *TaskAssigned) ReleaseAssigned() {
 	t.Lock()
 	defer t.Unlock()
 
-	t.releaseAssignedNoLock()
+	t.releaseAssignedLocked()
 }
 
-func (t *TaskAssigned) releaseAssignedNoLock() {
+func (t *TaskAssigned) releaseAssignedLocked() {
 	t.AssignedTime = time.Time{}
 	t.ExpireAt = time.Time{}
 	t.AssignedKey = ""
@@ -51,8 +52,8 @@ func (t *TaskAssigned) Updatable(key string) bool {
 	if t.AssignedKey == "" {
 		return true
 	}
-
-	timeout := time.Now().Sub(t.ExpireAt) > 0
+	
+	timeout := time.Since(t.ExpireAt) > 0
 	if key != t.AssignedKey && !timeout {
 		return false
 	}
@@ -61,24 +62,26 @@ func (t *TaskAssigned) Updatable(key string) bool {
 }
 
 type TaskManager struct {
-	Done chan bool // TODO 并发保护
+	Done chan bool
 
-	//Lock *sync.Mutex
+	
 
+	// TODO 需要二维索引
 	Tasks map[string]TaskAssigned // 任务只能在初始化Manager的时候添加
-	// TODO 可优化为RWMap
+	Lock *sync.Mutex
+	TasksAssignedTo map[string]map[string]TaskAssigned // key=workerName, taskName
 
 	doneCount int64
 	taskCount int64
 	Queue     chan Task
 
-	RunTimeout time.Duration // TODO 巡检超时任务，并做重新调度
+	RunTimeout time.Duration
 }
 
 func NewTaskManger(runTimeout time.Duration) *TaskManager {
 	m := &TaskManager{
 		Done:       make(chan bool),
-		Queue:      make(chan Task, 1000),
+		Queue:      make(chan Task, 1000), // 最多只能承载1000任务的正常调度
 		Tasks:      make(map[string]TaskAssigned),
 		RunTimeout: runTimeout,
 	}
@@ -101,14 +104,38 @@ func (m *TaskManager) Run() {
 
 }
 
-func (m *TaskManager) UpdateTaskStatus(taskName string, status string, assignedKey string) {
+func (m *TaskManager) AssignTaskTo(task TaskAssigned, key string, timeout time.Duration)  {
+	task.Assign(key, m.RunTimeout)
+
+	m.Lock.Lock()
+	taskMap := m.TasksAssignedTo[key]
+	if taskMap == nil {
+		taskMap = make(map[string]TaskAssigned)
+	}
+	taskMap[task.T.Info().Name] = task
+	m.TasksAssignedTo[key] = taskMap
+	m.Lock.Unlock()
+}
+
+func (m *TaskManager) ReleaseAssigned(task TaskAssigned, key string)  {
+	task.ReleaseAssigned()
+
+	m.Lock.Lock()
+	tasksAssignToKey := m.TasksAssignedTo[key]
+	delete(tasksAssignToKey, task.T.Info().Name)
+	m.Lock.Unlock()
+
+	log.Printf("release %s's assigned task %s", key, task.T)
+}
+
+func (m *TaskManager) UpdateTaskStatus(taskName string, status string, assignedKey string) error {
 	task, ok := m.Tasks[taskName]
 	if !ok {
-		return
+		return fmt.Errorf("task %s not found", taskName)
 	}
 
 	if !task.Updatable(assignedKey) {
-		return
+		return fmt.Errorf("worker %v unable to update task %s to status %s", assignedKey, taskName, )
 	}
 
 	if status == "done" {
@@ -118,7 +145,7 @@ func (m *TaskManager) UpdateTaskStatus(taskName string, status string, assignedK
 		}
 
 	} else if status == "running" {
-		task.Assign(assignedKey, m.RunTimeout)
+		m.AssignTaskTo(task, assignedKey, m.RunTimeout)
 	}
 
 	task.Lock()
@@ -128,11 +155,31 @@ func (m *TaskManager) UpdateTaskStatus(taskName string, status string, assignedK
 	// 重调度
 	if status == "error" {
 		log.Printf("task %v error. start reschedule\n", task)
+		m.ReleaseAssigned(task, assignedKey)
 
-		task.ReleaseAssigned()
 		m.Queue <- task.T
 	}
 }
+
+func (m *TaskManager) ReAssignWorkerTask(workerName string) {
+	var taskNeedEnqueuq []TaskAssigned
+
+	m.Lock.Lock()
+	taskMap := m.TasksAssignedTo[workerName]
+	for _, task := range taskMap {
+		task.ReleaseAssigned()
+		taskNeedEnqueuq = append(taskNeedEnqueuq, task)
+	}
+
+	m.Lock.Unlock()
+
+	for _, task := range taskNeedEnqueuq {
+		m.Queue <- task.T
+	}
+	
+}
+
+
 
 func (m *TaskManager) ScanTimeoutTask() {
 	for {
@@ -143,9 +190,13 @@ func (m *TaskManager) ScanTimeoutTask() {
 		for _, task := range m.Tasks {
 			task.Lock()
 			info := task.T.Info()
-			if info.Status == "running" && time.Now().Sub(task.ExpireAt) > 0 {
+			// FIXME 如果下面的是长时间的任务，那么这里的过期就会有问题
+
+			if info.Status == "running" && time.Since(task.ExpireAt) > 0 {
 				info.Status = "timeout"
-				task.releaseAssignedNoLock()
+
+				// TODO 这里也涉及到重调度
+				task.releaseAssignedLocked()
 				timeoutTasks = append(timeoutTasks, task.T)
 			}
 			task.Unlock()
@@ -154,6 +205,8 @@ func (m *TaskManager) ScanTimeoutTask() {
 		// FIXME  task MapTask-../pg-huckleberry_finn.txt timeout. start reschedule
 		// FIXME 任务已经完成了，但是仍然被扫描出了超时，并且被重调度，这应该是因为临界区的问题
 		// 在即将被扫描出超时的时候，任务做了上报done ？
+
+		
 
 		for _, task := range timeoutTasks {
 			log.Printf("task %v timeout. start reschedule\n", task)
