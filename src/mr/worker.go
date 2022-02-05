@@ -56,13 +56,14 @@ func Worker(mapf func(string, string) []KeyValue,
 		time.Sleep(time.Second)
 	}
 
+	go w.HeartBeat()
+
 	for {
 		task := w.getTask()
 		log.Printf("worker %v get task %v", w.Name, task)
 		// TODO 任务状态流转与上报
 
 		// 当前上报只有一次，不会在任务运行时做周期性上报，一旦上报请求失败，那么coordinator的任务状态更新也会失败，随后任务可能会被重新调度执行
-		// TODO 综合heartbeat 考虑是否在周期性heartbeat的时候同时上报任务状态?
 		w.reportTaskStatus(task, "running")
 		err := task.Do(w.ctx, w)
 		if err != nil {
@@ -96,7 +97,7 @@ func (w *worker) register() (registered bool) {
 
 func (w *worker) offline() (ok bool) {
 	w.cancelFn()
-	// TODO 清空相关操作
+
 	call("Coordinator.OfflineWorker", w.Name, &ok)
 	return
 }
@@ -146,7 +147,12 @@ func (w *worker) HeartBeat() {
 		case <-w.ctx.Done():
 			return
 		default:
-			call("Coordinator.HeartBeatWorker", w.Name, &struct{}{})
+			if !call("Coordinator.HeartBeatWorker", w.Name, &struct{}{}) {
+				// 心跳失败/超时时，尝试重新注册，在coordinator处恢复工作状态
+				log.Printf("worker %v heartbeat fail. try register again", w.Name)
+
+				w.register()
+			}
 		}
 	}
 }

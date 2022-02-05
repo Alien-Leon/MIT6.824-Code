@@ -95,6 +95,7 @@ func (t *MapTask) Do(ctx context.Context, w *worker) error {
 
 	for idx, kvs := range m {
 		// mr-{MapTaskNumber}-{ReduceTaskNumber} 任务提示可用这种形式的文件名存储中间kv，但这样的话shuffle过程就需要额外多的一步了
+		// TODO，完成之后再由coordinator来触发原子重命名，这样不会有冲突
 		filename := fmt.Sprintf("mr-intermediate-%v", idx)
 		f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
 		if err != nil {

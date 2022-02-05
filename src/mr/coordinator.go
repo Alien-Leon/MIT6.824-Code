@@ -7,13 +7,14 @@ import (
 	"strings"
 	"sync"
 
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"time"
+
 	"go.uber.org/atomic"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
 type Coordinator struct {
 	workers sync.Map // map[string]*WorkerInstance
@@ -27,9 +28,9 @@ type Coordinator struct {
 
 type WorkerInstance struct {
 	Name          string
-	HeartBeatTime atomic.Time // TODO 如果太久没有心跳，那么认为实例已离线，任务需要重新分发
+	heartBeatTime atomic.Time
 
-	// 如果任务因超时而离线，后续任务完成时又进行了上报，那么此时需要保证上报任务状态的原子性以及幂等性。
+	// TODO 如果任务因超时而离线，后续任务完成时又进行了上报，那么此时需要保证上报任务状态的原子性以及幂等性。
 	// 同时需要确认任务的归属，保证任务状态不会被其他worker修改
 }
 
@@ -43,6 +44,8 @@ type WorkerInstance struct {
 
 func (c *Coordinator) RegisterWorker(name string, registered *bool) error {
 	worker := &WorkerInstance{Name: name}
+	worker.heartBeatTime.Store(time.Now())
+	
 	_, loaded := c.workers.LoadOrStore(worker.Name, worker)
 	if loaded {
 		return fmt.Errorf("worker %v register conflict", name)
@@ -67,21 +70,24 @@ func (c *Coordinator) HeartBeatWorker(name string, _ *struct{}) error {
 		return fmt.Errorf("worker has not registered")
 	}
 	w := v.(*WorkerInstance)
-	w.HeartBeatTime.Store(time.Now())
+	w.heartBeatTime.Store(time.Now())
 	return nil
 }
 
 func (c *Coordinator) ReportTaskStatus(req ReportTaskStatusReq, _ *struct{}) error {
-	// TODO 按理说这边是需要校验worker是否正确的，有可能存在前一个worker上报超时，
-	// 而后一个worker已经在运行中，那么两边的任务状态上报会冲突
+	var err error
 	switch req.T.Info().Type {
 	case "MapTask":
-		c.mapTask.UpdateTaskStatus(req.T.Info().Name, req.Status, req.WorkerName)
+		err = c.mapTask.UpdateTaskStatus(req.T.Info().Name, req.Status, req.WorkerName)
 	case "ReduceTask":
-		c.reduceTask.UpdateTaskStatus(req.T.Info().Name, req.Status, req.WorkerName)
+		err = c.reduceTask.UpdateTaskStatus(req.T.Info().Name, req.Status, req.WorkerName)
 	}
 
-	log.Printf("worker %s report %v -> %v ", req.WorkerName, req.T, req.Status)
+	log.Printf("worker %s report %v -> %v err:%v", req.WorkerName, req.T, req.Status, err)
+
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -135,22 +141,23 @@ func (c *Coordinator) checkWorkerHealth() {
 
 	for {
 		now := time.Now()
-		
+
 		var workersUnhealthy []*WorkerInstance
 		c.workers.Range(func(key, value interface{}) bool {
 			w := value.(*WorkerInstance)
-			if now.Sub(w.HeartBeatTime.Load()) > healthTimeout {
-				c.mapTask.ReAssignWorkerTask(w.Name)
-				c.reduceTask.ReAssignWorkerTask(w.Name)
+			if now.Sub(w.heartBeatTime.Load()) > healthTimeout {
 				workersUnhealthy = append(workersUnhealthy, w)
 			}
 
 			return true
 		})
 
+		// 超时之后，删除worker注册，worker需感知然后重新注册
 		for _, worker := range workersUnhealthy {
-			c.workers.Delete(worker.Name)
 			log.Printf("worker %s is unhealthy, now cleaning.", worker.Name)
+			c.workers.Delete(worker.Name)
+			c.mapTask.ReAssignWorkerTask(worker.Name)
+			c.reduceTask.ReAssignWorkerTask(worker.Name)
 		}
 
 		time.Sleep(time.Second)
@@ -236,6 +243,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// 当主挂掉之后，所有从节点都不再工作，这样的流程是十分简单的，但可用性与效率并不好
 	// 所有的worker在整体任务结束前，都需要等待直至任务完成后才可退出，以防有失败的任务需要重新执行
 	go c.coordinate()
+	go c.checkWorkerHealth()
 
 	c.server()
 	return &c
